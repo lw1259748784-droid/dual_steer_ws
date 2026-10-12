@@ -1,0 +1,719 @@
+--- a/src/calf_work_control/calf_work_control/work_stop_supervisor.py
++++ b/src/calf_work_control/calf_work_control/work_stop_supervisor.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+ import math
++import time
+ from pathlib import Path
+ 
+ import yaml
+@@ -8,6 +9,7 @@
+ 
+ from nav_msgs.msg import Odometry
+ from std_msgs.msg import Bool, Float64, Int32, String
++from std_srvs.srv import Trigger
+ 
+ 
+ class WorkStopSupervisor(Node):
+@@ -57,6 +59,9 @@
+         self.declare_parameter('stopped_speed_threshold', 0.02)
+         self.declare_parameter('stopped_hold_time', 0.50)
+         self.declare_parameter('release_distance', 0.35)
++        self.declare_parameter('restart_start_radius', 0.35)
++        self.declare_parameter('restart_max_data_age', 0.75)
++        self.declare_parameter('stop_cross_track_tolerance_m', 0.40)
+ 
+         self.declare_parameter('feeding_start_topic', '/feeding/start')
+         self.declare_parameter('feeding_done_topic', '/feeding/done')
+@@ -94,6 +99,12 @@
+         self.release_distance = max(
+             self.stop_distance,
+             float(self.get_parameter('release_distance').value))
++        self.restart_start_radius = max(
++            0.05, float(self.get_parameter('restart_start_radius').value))
++        self.restart_max_data_age = max(
++            0.1, float(self.get_parameter('restart_max_data_age').value))
++        self.stop_cross_track_tolerance_m = max(
++            0.05, float(self.get_parameter('stop_cross_track_tolerance_m').value))
+ 
+         if self.stop_distance >= self.approach_distance:
+             raise ValueError(
+@@ -107,6 +118,8 @@
+         self.x = None
+         self.y = None
+         self.speed = None
++        self.pose_received_at = None
++        self.speed_received_at = None
+ 
+         self.state = 'WAIT_ROUTE'
+         self.stop_active = False
+@@ -115,6 +128,7 @@
+         self.stopped_since = None
+         self.feeding_start_sent = False
+         self.last_feeding_done = False
++        self.stop_armed = False
+ 
+         self.stop_pub = self.create_publisher(
+             Bool, str(self.get_parameter('stop_topic').value), 10)
+@@ -137,6 +151,13 @@
+             self.feeding_done_callback,
+             10)
+ 
++        self.create_service(
++            Trigger, '~/reset_at_start', self.reset_at_start_callback)
++        self.create_service(
++            Trigger, '~/start_cycle', self.start_cycle_callback)
++        self.create_service(
++            Trigger, '~/hold_at_start', self.hold_at_start_callback)
++
+         self.load_route()
+         self.create_timer(0.05, self.control_timer)  # 20 Hz
+ 
+@@ -221,6 +242,7 @@
+ 
+             self.target_seq_index = 0
+             self.state = 'RUN' if self.stop_sequence else 'DONE'
++            self.stop_armed = False
+ 
+             semantic_summary = ', '.join(
+                 f'P{p["id"]}:{p["type"]}'
+@@ -249,9 +271,89 @@
+     def pose_callback(self, msg):
+         self.x = float(msg.pose.pose.position.x)
+         self.y = float(msg.pose.pose.position.y)
++        self.pose_received_at = time.monotonic()
+ 
+     def speed_callback(self, msg):
+         self.speed = float(msg.twist.twist.linear.x)
++        self.speed_received_at = time.monotonic()
++
++    def restart_precondition(self):
++        """Check current RTK position and chassis speed before cycle reset."""
++        if not self.points or not self.stop_sequence:
++            return 'Route or stop sequence unavailable'
++        starts = [p for p in self.points if p['type'] == 'start']
++        if len(starts) != 1:
++            return 'Route must contain exactly one start point'
++        now = time.monotonic()
++        if (self.x is None or self.y is None or self.pose_received_at is None or
++                now - self.pose_received_at > self.restart_max_data_age):
++            return 'Fresh /odom position is required'
++        if (self.speed is None or self.speed_received_at is None or
++                now - self.speed_received_at > self.restart_max_data_age):
++            return 'Fresh /wheel_odom speed is required'
++        if not all(math.isfinite(v) for v in (self.x, self.y, self.speed)):
++            return 'Position or speed is not finite'
++        start = starts[0]
++        distance = math.hypot(self.x - start['x'], self.y - start['y'])
++        if distance > self.restart_start_radius:
++            return f'Vehicle is {distance:.2f} m from P{start["id"]}'
++        if abs(self.speed) > self.stopped_speed_threshold:
++            return f'Vehicle is still moving at {self.speed:.3f} m/s'
++        return None
++
++    def reset_at_start_callback(self, _request, response):
++        reason = self.restart_precondition()
++        if reason:
++            response.success = False
++            response.message = reason
++            return response
++        # Reload any edited stop-point types, then verify the new route too.
++        self.load_route()
++        reason = self.restart_precondition()
++        if reason:
++            self.stop_active = True
++            self.speed_scale = 0.0
++            self.state = 'READY_AT_START'
++            response.success = False
++            response.message = reason
++            return response
++        self.target_seq_index = 0
++        self.stopped_since = None
++        self.feeding_start_sent = False
++        self.last_feeding_done = False
++        self.stop_armed = False
++        self.stop_active = True
++        self.speed_scale = 0.0
++        self.state = 'READY_AT_START'
++        self.publish_status()
++        response.success = True
++        response.message = 'Stop sequence reset; output held until start_cycle'
++        return response
++
++    def start_cycle_callback(self, _request, response):
++        reason = self.restart_precondition()
++        if self.state != 'READY_AT_START':
++            reason = 'Call reset_at_start before start_cycle'
++        if reason:
++            response.success = False
++            response.message = reason
++            return response
++        self.state = 'RUN'
++        self.stop_active = False
++        self.speed_scale = 1.0
++        self.publish_status()
++        response.success = True
++        response.message = 'New stop sequence running'
++        return response
++
++    def hold_at_start_callback(self, _request, response):
++        self.state = 'READY_AT_START'
++        self.stop_active = True
++        self.speed_scale = 0.0
++        self.publish_status()
++        response.success = True
++        response.message = 'Velocity gate held at zero'
++        return response
+ 
+     def feeding_done_callback(self, msg):
+         current = bool(msg.data)
+@@ -271,6 +373,7 @@
+             self.stopped_since = None
+ 
+             self.target_seq_index += 1
++            self.stop_armed = False
+             if self.target_seq_index >= len(self.stop_sequence):
+                 self.state = 'DONE'
+ 
+@@ -300,6 +403,27 @@
+             target['x'] - self.x,
+             target['y'] - self.y)
+ 
++    def target_approach(self):
++        """Return remaining distance along the incoming segment and lateral error."""
++        target_id = self.current_target_point_number()
++        index = next((i for i, p in enumerate(self.points)
++                      if p['id'] == target_id), None)
++        if index is None or index == 0 or self.x is None or self.y is None:
++            return None
++        previous = self.points[index - 1]
++        target = self.points[index]
++        dx = target['x'] - previous['x']
++        dy = target['y'] - previous['y']
++        length = math.hypot(dx, dy)
++        if length < 0.01:
++            return None
++        ux, uy = dx / length, dy / length
++        to_target_x = target['x'] - self.x
++        to_target_y = target['y'] - self.y
++        remaining = to_target_x * ux + to_target_y * uy
++        lateral = abs(to_target_x * uy - to_target_y * ux)
++        return remaining, lateral
++
+     def publish_status(self):
+         b = Bool()
+         b.data = bool(self.stop_active)
+@@ -319,9 +443,22 @@
+         self.target_pub.publish(t)
+ 
+     def control_timer(self):
++        if self.state == 'READY_AT_START':
++            self.stop_active = True
++            self.speed_scale = 0.0
++            self.publish_status()
++            return
++        now = time.monotonic()
++        if (self.pose_received_at is None or self.speed_received_at is None or
++                now - self.pose_received_at > self.restart_max_data_age or
++                now - self.speed_received_at > self.restart_max_data_age):
++            self.stop_active = True
++            self.speed_scale = 0.0
++            self.publish_status()
++            return
+         if not self.points or not self.stop_sequence:
+-            self.stop_active = False
+-            self.speed_scale = 1.0
++            self.stop_active = True
++            self.speed_scale = 0.0
+             self.publish_status()
+             return
+ 
+@@ -337,25 +474,37 @@
+             return
+ 
+         target_p = self.current_target_point_number()
++        approach = self.target_approach()
+ 
+         if self.state in ('RUN', 'APPROACH'):
+             self.stop_active = False
+ 
+-            if dist <= self.stop_distance:
++            if dist <= self.approach_distance or (
++                approach is not None and
++                0.0 <= approach[0] <= self.approach_distance and
++                approach[1] <= self.stop_cross_track_tolerance_m
++            ):
++                self.stop_armed = True
++
++            crossed_stop_plane = (
++                self.stop_armed and approach is not None and
++                approach[0] <= self.stop_distance)
++            if dist <= self.stop_distance or crossed_stop_plane:
+                 self.state = 'STOPPING'
+                 self.stop_active = True
+                 self.speed_scale = 0.0
+                 self.stopped_since = None
+                 self.get_logger().info(
+-                    f'P{target_p} reached (d={dist:.3f} m). '
++                    f'P{target_p} reached (d={dist:.3f} m, '
++                    f'along={approach[0] if approach else float("nan"):.3f} m). '
+                     'Commanding full stop.')
+ 
+-            elif dist <= self.approach_distance:
++            elif self.stop_armed:
+                 self.state = 'APPROACH'
+ 
+                 # 0 at stop_distance, 1 at approach_distance.
+                 ratio = (
+-                    (dist - self.stop_distance) /
++                    ((approach[0] if approach else dist) - self.stop_distance) /
+                     (self.approach_distance - self.stop_distance)
+                 )
+                 ratio = max(0.0, min(1.0, ratio))
+--- a/src/calf_work_control/calf_work_control/cmd_vel_mode_gate.py
++++ b/src/calf_work_control/calf_work_control/cmd_vel_mode_gate.py
+@@ -29,6 +29,7 @@
+         self.declare_parameter('stop_topic', '/work_stop_active')
+         self.declare_parameter('speed_scale_topic', '/work_speed_scale')
+         self.declare_parameter('command_timeout', 0.50)
++        self.declare_parameter('status_timeout', 0.50)
+         self.declare_parameter('publish_rate', 20.0)
+ 
+         self.input_topic = str(
+@@ -37,6 +38,8 @@
+             self.get_parameter('output_topic').value)
+         self.command_timeout = max(
+             0.05, float(self.get_parameter('command_timeout').value))
++        self.status_timeout = max(
++            0.1, float(self.get_parameter('status_timeout').value))
+         self.publish_rate = max(
+             2.0, float(self.get_parameter('publish_rate').value))
+ 
+@@ -44,8 +47,10 @@
+         self.have_cmd = False
+         self.last_cmd_time = 0.0
+ 
+-        self.stop_active = False
++        self.stop_active = True
+         self.speed_scale = 1.0
++        self.last_stop_time = None
++        self.last_scale_time = None
+ 
+         self.create_subscription(
+             Twist, self.input_topic, self.cmd_callback, 20)
+@@ -78,9 +83,11 @@
+ 
+     def stop_callback(self, msg):
+         self.stop_active = bool(msg.data)
++        self.last_stop_time = time.monotonic()
+ 
+     def scale_callback(self, msg):
+         self.speed_scale = max(0.0, min(1.0, float(msg.data)))
++        self.last_scale_time = time.monotonic()
+ 
+     def publish_timer(self):
+         out = Twist()
+@@ -90,7 +97,12 @@
+             or (time.monotonic() - self.last_cmd_time) > self.command_timeout
+         )
+ 
+-        if stale or self.stop_active:
++        status_stale = (
++            self.last_stop_time is None or self.last_scale_time is None or
++            (time.monotonic() - self.last_stop_time) > self.status_timeout or
++            (time.monotonic() - self.last_scale_time) > self.status_timeout
++        )
++        if stale or status_stale or self.stop_active:
+             self.pub.publish(out)
+             return
+ 
+--- /dev/null
++++ b/src/calf_work_control/calf_work_control/restart_route_at_p1.py
+@@ -0,0 +1,343 @@
++#!/usr/bin/env python3
++"""One-shot, guarded restart of the saved route after returning to P1.
++
++Run this command once per restart. It never replays an old Nav2 goal.
++The project's map->odom transform is an identity; /odom is therefore in
++the same XY coordinates as the saved route. Abort if that is not true.
++"""
++
++import argparse
++import math
++import time
++from pathlib import Path
++
++import yaml
++import rclpy
++from action_msgs.msg import GoalStatus, GoalStatusArray
++from action_msgs.srv import CancelGoal
++from nav2_msgs.action import NavigateToPose
++from nav_msgs.msg import Odometry, Path as NavPath
++from rcl_interfaces.msg import ParameterType
++from rcl_interfaces.srv import GetParameters
++from rclpy.action import ActionClient
++from rclpy.node import Node
++from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
++from rclpy.time import Time
++from std_msgs.msg import Bool
++from std_srvs.srv import Trigger
++from tf2_ros import Buffer, TransformListener
++
++
++DEFAULT_ROUTE = '/home/tl/dual_steer_ws/routes/current_route.yaml'
++TERMINAL = {
++    GoalStatus.STATUS_SUCCEEDED,
++    GoalStatus.STATUS_CANCELED,
++    GoalStatus.STATUS_ABORTED,
++}
++
++
++def heading(a, b):
++    return math.atan2(float(b['y']) - float(a['y']),
++                      float(b['x']) - float(a['x']))
++
++
++def angle_error(a, b):
++    return math.atan2(math.sin(a - b), math.cos(a - b))
++
++
++def read_route(path):
++    data = yaml.safe_load(Path(path).read_text(encoding='utf-8'))
++    points = data['points']
++    if len(points) < 2 or points[0].get('type') != 'start':
++        raise ValueError('Route needs P1 as its first start point and a second point')
++    if data.get('frame_id') != 'map':
++        raise ValueError('This command requires a route in the map frame')
++    if not all(math.isfinite(float(p[k])) for p in points for k in ('x', 'y')):
++        raise ValueError('Route contains a non-finite coordinate')
++    return points
++
++
++class RestartClient(Node):
++    def __init__(self, points, args):
++        super().__init__('restart_route_at_p1')
++        self.points = points
++        self.args = args
++        self.pose = None
++        self.pose_at = None
++        self.speed = None
++        self.speed_at = None
++        self.rtk_fixed = False
++        self.rtk_at = None
++        self.feedback_healthy = False
++        self.feedback_at = None
++        self.path = None
++        self.path_at = None
++        self.statuses = None
++        self.stable_since = None
++        self.tf_buffer = Buffer()
++        self.tf_listener = TransformListener(self.tf_buffer, self)
++
++        self.create_subscription(Odometry, '/odom', self.on_pose, 10)
++        self.create_subscription(Odometry, '/wheel_odom', self.on_speed, 10)
++        self.create_subscription(Bool, '/gps/rtk_fixed', self.on_rtk, 10)
++        self.create_subscription(
++            Bool, '/chassis_feedback_healthy', self.on_feedback, 10)
++        latched = QoSProfile(
++            depth=10, reliability=ReliabilityPolicy.RELIABLE,
++            durability=DurabilityPolicy.TRANSIENT_LOCAL)
++        self.create_subscription(NavPath, '/global_path', self.on_path, latched)
++        self.create_subscription(
++            GoalStatusArray, '/navigate_to_pose/_action/status',
++            self.on_status, latched)
++
++        self.action = ActionClient(self, NavigateToPose, '/navigate_to_pose')
++        self.cancel_client = self.create_client(
++            CancelGoal, '/navigate_to_pose/_action/cancel_goal')
++        self.path_load = self.create_client(Trigger, '/path_editor/load')
++        self.planner_reset = self.create_client(
++            Trigger, '/topic_planner/reset_progress')
++        self.work_reset = self.create_client(
++            Trigger, '/work_stop_supervisor/reset_at_start')
++        self.work_start = self.create_client(
++            Trigger, '/work_stop_supervisor/start_cycle')
++        self.work_hold = self.create_client(
++            Trigger, '/work_stop_supervisor/hold_at_start')
++        self.can_params = self.create_client(
++            GetParameters, '/ackermann_can_controller/get_parameters')
++        self.gate_params = self.create_client(
++            GetParameters, '/cmd_vel_mode_gate/get_parameters')
++
++    def on_pose(self, msg):
++        self.pose = msg
++        self.pose_at = time.monotonic()
++
++    def on_speed(self, msg):
++        self.speed = float(msg.twist.twist.linear.x)
++        self.speed_at = time.monotonic()
++
++    def on_rtk(self, msg):
++        self.rtk_fixed = bool(msg.data)
++        self.rtk_at = time.monotonic()
++
++    def on_feedback(self, msg):
++        self.feedback_healthy = bool(msg.data)
++        self.feedback_at = time.monotonic()
++
++    def on_path(self, msg):
++        self.path = msg
++        self.path_at = time.monotonic()
++
++    def on_status(self, msg):
++        self.statuses = msg.status_list
++
++    def ready_reason(self):
++        now = time.monotonic()
++        fresh = self.args.max_data_age
++        if self.pose is None or self.pose_at is None or now - self.pose_at > fresh:
++            return 'waiting for fresh /odom'
++        if self.pose.header.frame_id not in ('odom', 'map'):
++            return f'unexpected odometry frame: {self.pose.header.frame_id}'
++        if self.pose.header.frame_id == 'odom':
++            try:
++                transform = self.tf_buffer.lookup_transform('map', 'odom', Time())
++            except Exception:
++                return 'waiting for map -> odom transform'
++            p = transform.transform.translation
++            q_tf = transform.transform.rotation
++            yaw_tf = math.atan2(
++                2.0 * (q_tf.w * q_tf.z + q_tf.x * q_tf.y),
++                1.0 - 2.0 * (q_tf.y * q_tf.y + q_tf.z * q_tf.z))
++            if (math.hypot(p.x, p.y) > 0.05 or
++                    abs(angle_error(yaw_tf, 0.0)) > 0.05):
++                return 'map -> odom is not identity; /odom and route XY differ'
++        if self.speed_at is None or now - self.speed_at > fresh:
++            return 'waiting for fresh /wheel_odom'
++        if self.rtk_at is None or now - self.rtk_at > fresh or not self.rtk_fixed:
++            return 'RTK is not fixed or /gps/rtk_fixed is stale'
++        if (self.feedback_at is None or now - self.feedback_at > fresh or
++                not self.feedback_healthy):
++            return 'CAN feedback is unhealthy or stale'
++        pos = self.pose.pose.pose.position
++        q = self.pose.pose.pose.orientation
++        values = (pos.x, pos.y, self.speed, q.x, q.y, q.z, q.w)
++        if not all(math.isfinite(v) for v in values):
++            return 'odometry or speed is not finite'
++        if abs(math.hypot(q.x, q.y, q.z, q.w) - 1.0) > 0.1:
++            return 'invalid odometry orientation'
++        distance = math.hypot(
++            pos.x - float(self.points[0]['x']),
++            pos.y - float(self.points[0]['y']))
++        if distance > self.args.start_radius:
++            return f'P1 distance {distance:.2f} m exceeds {self.args.start_radius:.2f} m'
++        if abs(self.speed) > self.args.max_speed:
++            return f'chassis speed {self.speed:.3f} m/s is not zero'
++        actual_yaw = math.atan2(
++            2.0 * (q.w * q.z + q.x * q.y),
++            1.0 - 2.0 * (q.y * q.y + q.z * q.z))
++        yaw_error = abs(angle_error(
++            actual_yaw, heading(self.points[0], self.points[1])))
++        if yaw_error > math.radians(self.args.heading_tolerance_deg):
++            return f'P1 heading error {math.degrees(yaw_error):.1f} degrees'
++        return None
++
++    def wait_until_ready(self):
++        deadline = time.monotonic() + self.args.wait_seconds
++        self.stable_since = None
++        last_reason = None
++        while time.monotonic() < deadline:
++            rclpy.spin_once(self, timeout_sec=0.1)
++            reason = self.ready_reason()
++            if reason:
++                self.stable_since = None
++                last_reason = reason
++                continue
++            if self.stable_since is None:
++                self.stable_since = time.monotonic()
++            if time.monotonic() - self.stable_since >= self.args.stable_seconds:
++                return
++        raise RuntimeError(last_reason or 'P1 conditions did not remain stable')
++
++    def call(self, client, request, name, timeout=5.0):
++        if not client.wait_for_service(timeout_sec=timeout):
++            raise RuntimeError(f'{name} service is unavailable')
++        future = client.call_async(request)
++        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout)
++        if not future.done() or future.exception() is not None:
++            raise RuntimeError(f'{name} service failed or timed out')
++        return future.result()
++
++    def trigger(self, client, name):
++        result = self.call(client, Trigger.Request(), name)
++        if not result.success:
++            raise RuntimeError(f'{name}: {result.message}')
++
++    def parameter_strings(self, client, names, node_name):
++        request = GetParameters.Request()
++        request.names = names
++        result = self.call(client, request, node_name)
++        if len(result.values) != len(names):
++            raise RuntimeError(f'{node_name}: missing parameter')
++        if any(value.type != ParameterType.PARAMETER_STRING
++               for value in result.values):
++            raise RuntimeError(f'{node_name}: expected string parameters')
++        return [value.string_value for value in result.values]
++
++    def verify_command_wiring(self):
++        (can_topic,) = self.parameter_strings(
++            self.can_params, ['cmd_vel_topic'], 'CAN command topic')
++        gate_input, gate_output = self.parameter_strings(
++            self.gate_params, ['input_topic', 'output_topic'], 'Velocity gate topics')
++        if (can_topic != '/cmd_vel_final' or gate_input != '/cmd_vel' or
++                gate_output != '/cmd_vel_final'):
++            raise RuntimeError(
++                'Expected /cmd_vel -> gate -> /cmd_vel_final -> CAN; '
++                f'found gate={gate_input}->{gate_output}, CAN={can_topic}')
++        if (self.count_publishers('/cmd_vel_final') != 1 or
++                self.count_subscribers('/cmd_vel_final') < 1):
++            raise RuntimeError('/cmd_vel_final needs one gate publisher and a CAN subscriber')
++
++    def active_goals(self):
++        return bool(self.statuses) and any(
++            status.status not in TERMINAL
++            for status in self.statuses)
++
++    def cancel_old_goal(self):
++        response = self.call(
++            self.cancel_client, CancelGoal.Request(), 'Nav2 cancel')
++        if response.return_code != 0:
++            raise RuntimeError(f'Nav2 cancel returned code {response.return_code}')
++        deadline = time.monotonic() + 8.0
++        while self.active_goals() and time.monotonic() < deadline:
++            rclpy.spin_once(self, timeout_sec=0.1)
++        if self.active_goals():
++            raise RuntimeError('Previous NavigateToPose goal did not terminate')
++
++    def verify_reloaded_path(self, after):
++        deadline = time.monotonic() + 3.0
++        while time.monotonic() < deadline:
++            rclpy.spin_once(self, timeout_sec=0.1)
++            if self.path_at is None or self.path_at <= after or not self.path:
++                continue
++            if len(self.path.poses) < 2 or self.path.header.frame_id != 'map':
++                raise RuntimeError('Reloaded /global_path is empty or not in map')
++            for expected, actual in (
++                    (self.points[0], self.path.poses[0].pose.position),
++                    (self.points[-1], self.path.poses[-1].pose.position)):
++                if math.hypot(actual.x - float(expected['x']),
++                              actual.y - float(expected['y'])) > 0.05:
++                    raise RuntimeError('Published /global_path does not match route endpoints')
++            return
++        raise RuntimeError('No fresh /global_path after reloading route')
++
++    def send_new_goal(self):
++        goal = NavigateToPose.Goal()
++        goal.pose.header.frame_id = 'map'
++        goal.pose.header.stamp = self.get_clock().now().to_msg()
++        last = self.points[-1]
++        goal.pose.pose.position.x = float(last['x'])
++        goal.pose.pose.position.y = float(last['y'])
++        yaw = heading(self.points[-2], last)
++        goal.pose.pose.orientation.z = math.sin(yaw / 2.0)
++        goal.pose.pose.orientation.w = math.cos(yaw / 2.0)
++        future = self.action.send_goal_async(goal)
++        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
++        if not future.done() or future.exception() is not None:
++            raise RuntimeError('New NavigateToPose goal timed out')
++        handle = future.result()
++        if not handle.accepted:
++            raise RuntimeError('Nav2 rejected the new route goal')
++        return handle
++
++    def restart(self):
++        self.wait_until_ready()
++        if not self.action.wait_for_server(timeout_sec=3.0):
++            raise RuntimeError('/navigate_to_pose action server is unavailable')
++        self.verify_command_wiring()
++        self.cancel_old_goal()
++        # Recheck after cancellation: cancellation can take several seconds.
++        self.wait_until_ready()
++        reload_started = time.monotonic()
++        self.trigger(self.path_load, 'Reload route editor')
++        self.verify_reloaded_path(reload_started)
++        self.trigger(self.planner_reset, 'Reset TopicPlanner progress')
++        self.trigger(self.work_reset, 'Reset work-stop sequence at P1')
++        try:
++            self.wait_until_ready()
++            self.send_new_goal()
++            self.trigger(self.work_start, 'Release new route cycle')
++        except Exception:
++            # A timed-out start_cycle may have released the gate. Re-assert
++            # the hold before cancelling the newly accepted Nav2 task.
++            try:
++                self.trigger(self.work_hold, 'Hold route cycle')
++            finally:
++                self.cancel_old_goal()
++            raise
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--route', default=DEFAULT_ROUTE)
++    parser.add_argument('--wait-seconds', type=float, default=30.0)
++    parser.add_argument('--start-radius', type=float, default=0.35)
++    parser.add_argument('--heading-tolerance-deg', type=float, default=20.0)
++    parser.add_argument('--max-speed', type=float, default=0.02)
++    parser.add_argument('--max-data-age', type=float, default=0.75)
++    parser.add_argument('--stable-seconds', type=float, default=1.0)
++    args = parser.parse_args()
++    points = read_route(args.route)
++    rclpy.init()
++    node = RestartClient(points, args)
++    try:
++        node.restart()
++        print('New route goal accepted; stop sequence reset and released.')
++    except Exception as exc:
++        node.get_logger().error(f'Route restart refused: {exc}')
++        raise SystemExit(1)
++    finally:
++        node.destroy_node()
++        rclpy.shutdown()
++
++
++if __name__ == '__main__':
++    main()
+--- a/src/calf_work_control/config/work_control.yaml
++++ b/src/calf_work_control/config/work_control.yaml
+@@ -30,6 +30,9 @@
+     # Confirm actual stop using /wheel_odom.
+     stopped_speed_threshold: 0.02
+     stopped_hold_time: 0.50
++    restart_start_radius: 0.35
++    restart_max_data_age: 0.75
++    stop_cross_track_tolerance_m: 0.40
+ 
+     feeding_start_topic: /feeding/start
+     feeding_done_topic: /feeding/done
+@@ -51,6 +54,7 @@
+     speed_scale_topic: /work_speed_scale
+ 
+     command_timeout: 0.50
++    status_timeout: 0.50
+     publish_rate: 20.0
+ 
+ feeding_mock:
+--- a/src/calf_work_control/package.xml
++++ b/src/calf_work_control/package.xml
+@@ -15,6 +15,11 @@
+   <exec_depend>std_msgs</exec_depend>
+   <exec_depend>python3-yaml</exec_depend>
+   <exec_depend>ament_index_python</exec_depend>
++  <exec_depend>std_srvs</exec_depend>
++  <exec_depend>action_msgs</exec_depend>
++  <exec_depend>nav2_msgs</exec_depend>
++  <exec_depend>tf2_ros</exec_depend>
++  <exec_depend>rcl_interfaces</exec_depend>
+ 
+   <export>
+     <build_type>ament_python</build_type>
+--- a/src/calf_work_control/setup.py
++++ b/src/calf_work_control/setup.py
+@@ -28,6 +28,7 @@
+             'work_stop_supervisor = calf_work_control.work_stop_supervisor:main',
+             'cmd_vel_mode_gate = calf_work_control.cmd_vel_mode_gate:main',
+             'feeding_mock = calf_work_control.feeding_mock:main',
++            'restart_route_at_p1 = calf_work_control.restart_route_at_p1:main',
+         ],
+     },
+ )

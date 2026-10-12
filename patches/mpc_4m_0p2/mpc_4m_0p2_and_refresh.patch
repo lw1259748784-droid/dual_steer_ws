@@ -1,0 +1,228 @@
+--- a/src/nav2_humble/config/nav2_params_dual_steer_no_map.yaml
++++ b/src/nav2_humble/config/nav2_params_dual_steer_no_map.yaml
+@@ -286,15 +286,9 @@
+       min_turning_radius: 2.80
+       
+ 
+-      # Speed-profile base settings:
+-      #   Straight sections: MPC may command up to 0.50 m/s.
+-      #   P5..P16 turn section: an external route_speed_limiter caps the
+-      #   command to 0.25 m/s while preserving curvature (v and wz scaled together).
+-      #   The current MPC plugin exposes only one desired_speed/max_speed pair,
+-      #   so P-index-dependent speed selection is intentionally NOT faked here
+-      #   with undeclared parameters.
+-      desired_speed: 0.30
+-      max_speed: 0.30
++      # Cruise speed cap. Goal approach and safety checks may command less or zero.
++      desired_speed: 0.20
++      max_speed: 0.20
+       min_speed: 0.0
+       max_accel: 0.25
+       max_decel: 0.35
+@@ -320,7 +314,7 @@
+       max_robot_pose_search_dist: 2.5
+       # Fail safe rather than making a large off-route correction.
+       max_reference_deviation_m: 1.5
+-      seed_lookahead_dist: 1.50
++      seed_lookahead_dist: 4.00
+       transform_tolerance: 0.20
+ 
+       # Goal approach
+@@ -766,7 +760,7 @@
+ 
+     max_velocity:
+ 
+-      - 0.30
++      - 0.20
+ 
+       - 0.0
+ 
+--- a/src/nav2_humble/config/nav2_params_dual_steer_mpc_tracking.yaml
++++ b/src/nav2_humble/config/nav2_params_dual_steer_mpc_tracking.yaml
+@@ -90,8 +90,8 @@
+       plugin: dual_steer_mpc_controller::MPCController
+       wheelbase: 1.7
+       min_turning_radius: 2.8
+-      desired_speed: 0.15
+-      max_speed: 0.15
++      desired_speed: 0.2
++      max_speed: 0.2
+       min_speed: 0.0
+       max_accel: 0.25
+       max_decel: 0.35
+@@ -105,7 +105,7 @@
+       reference_path_length: 4.0
+       max_robot_pose_search_dist: 2.5
+       max_reference_deviation_m: 1.5
+-      seed_lookahead_dist: 1.0
++      seed_lookahead_dist: 4.0
+       transform_tolerance: 0.2
+       slow_down_distance: 2.5
+       stop_distance: 0.15
+@@ -267,7 +267,7 @@
+     scale_velocities: false
+     feedback: OPEN_LOOP
+     max_velocity:
+-    - 0.3
++    - 0.2
+     - 0.0
+     - 0.2
+     min_velocity:
+--- a/src/nav2_humble/behavior_trees/navigate_to_pose_dual_steer.xml
++++ b/src/nav2_humble/behavior_trees/navigate_to_pose_dual_steer.xml
+@@ -7,20 +7,20 @@
+     <PipelineSequence name="NavigateDualSteer">
+ 
+       <!--
+-        每移动 1 m 允许重新请求一次全局路径。
++        每秒重新请求一次全局路径，使 /path_editor/load 的更新进入当前导航任务。
+         TopicPlanner 会从 /global_path 获取路径。
+       -->
+-      <DistanceController distance="1.0">
++      <RateController hz="1.0">
+ 
+         <ComputePathToPose
+           goal="{goal}"
+           path="{path}"
+           planner_id="TopicPlanner"/>
+ 
+-      </DistanceController>
++      </RateController>
+ 
+       <!--
+-        使用当前配置好的 Regulated Pure Pursuit
++        使用当前配置好的 FollowPath 控制器
+       -->
+       <FollowPath
+         path="{path}"
+--- a/src/dual_steer_mpc_controller/src/mpc_controller.cpp
++++ b/src/dual_steer_mpc_controller/src/mpc_controller.cpp
+@@ -71,8 +71,8 @@
+ 
+   declare_double("wheelbase", 1.70);
+   declare_double("min_turning_radius", 2.80);
+-  declare_double("desired_speed", 0.15);
+-  declare_double("max_speed", 0.15);
++  declare_double("desired_speed", 0.20);
++  declare_double("max_speed", 0.20);
+   declare_double("min_speed", 0.0);
+   declare_double("max_accel", 0.20);
+   declare_double("max_decel", 0.30);
+@@ -90,7 +90,7 @@
+   declare_double("reference_path_length", 4.0);
+   declare_double("max_robot_pose_search_dist", 2.5);
+   declare_double("max_reference_deviation_m", 1.5);
+-  declare_double("seed_lookahead_dist", 1.00);
++  declare_double("seed_lookahead_dist", 4.00);
+   declare_double("transform_tolerance", 0.20);
+   declare_double("slow_down_distance", 1.50);
+   declare_double("stop_distance", 0.10);
+@@ -777,7 +777,7 @@
+   }
+ 
+   // Do not pull a 5 s prediction toward the end of a 4 m reference path:
+-  // at 0.3 m/s the vehicle can only reach about 1.5 m over that horizon.
++  // the vehicle may reach only a fraction of the reference length over the horizon.
+   // Use a reference target at the horizon's *reachable arc length* instead.
+   const double reachable_length =
+     std::max(0.0, target_speed) * model_dt_ * static_cast<double>(sequence.size());
+--- a/src/rviz_path_editor/src/rviz_path_editor_node.cpp
++++ b/src/rviz_path_editor/src/rviz_path_editor_node.cpp
+@@ -57,7 +57,7 @@
+     declare_parameter<std::string>("current_point_type", "waypoint");
+     declare_parameter<std::string>("turn_direction", "left");
+     declare_parameter<double>("turn_min_turning_radius", 2.80);
+-    declare_parameter<double>("turn_speed_limit", 0.15);
++    declare_parameter<double>("turn_speed_limit", 0.20);
+     declare_parameter<double>("turn_resolution", 0.10);
+ 
+     frame_id_ = get_parameter("frame_id").as_string();
+@@ -166,7 +166,7 @@
+     int to_id{0};
+     std::string direction{"auto"};  // auto / left / right
+     double min_turning_radius{2.80};
+-    double speed_limit{0.15};      // metadata for future speed control
++    double speed_limit{0.20};      // metadata for future speed control
+     double resolution{0.10};
+   };
+ 
+--- a/src/rviz_route_editor_panel_bundle/patched_rviz_path_editor/rviz_path_editor_node.cpp
++++ b/src/rviz_route_editor_panel_bundle/patched_rviz_path_editor/rviz_path_editor_node.cpp
+@@ -57,7 +57,7 @@
+     declare_parameter<std::string>("current_point_type", "waypoint");
+     declare_parameter<std::string>("turn_direction", "left");
+     declare_parameter<double>("turn_min_turning_radius", 2.80);
+-    declare_parameter<double>("turn_speed_limit", 0.15);
++    declare_parameter<double>("turn_speed_limit", 0.20);
+     declare_parameter<double>("turn_resolution", 0.10);
+ 
+     frame_id_ = get_parameter("frame_id").as_string();
+@@ -166,7 +166,7 @@
+     int to_id{0};
+     std::string direction{"auto"};  // auto / left / right
+     double min_turning_radius{2.80};
+-    double speed_limit{0.15};      // metadata for future speed control
++    double speed_limit{0.20};      // metadata for future speed control
+     double resolution{0.10};
+   };
+ 
+--- a/src/rviz_route_editor_panel_bundle/rviz_route_editor_panel/src/route_editor_panel.cpp
++++ b/src/rviz_route_editor_panel_bundle/rviz_route_editor_panel/src/route_editor_panel.cpp
+@@ -111,7 +111,7 @@
+   speed_spin_->setRange(0.01, 2.0);
+   speed_spin_->setDecimals(2);
+   speed_spin_->setSingleStep(0.01);
+-  speed_spin_->setValue(0.15);
++  speed_spin_->setValue(0.20);
+   speed_spin_->setSuffix(" m/s");
+ 
+   resolution_spin_ = new QDoubleSpinBox();
+--- a/src/rviz_route_editor_panel_bundle/example_semantic_route.yaml
++++ b/src/rviz_route_editor_panel_bundle/example_semantic_route.yaml
+@@ -49,5 +49,5 @@
+     to_id: 5
+     direction: left
+     min_turning_radius: 2.80
+-    speed_limit: 0.15
++    speed_limit: 0.20
+     resolution: 0.10
+--- a/tools/apply_mpc_tracking_parameters.py
++++ b/tools/apply_mpc_tracking_parameters.py
+@@ -7,8 +7,8 @@
+ 
+ UPDATES = {
+     'wheelbase': 1.70,
+-    'desired_speed': 0.15,
+-    'max_speed': 0.15,
++    'desired_speed': 0.20,
++    'max_speed': 0.20,
+     'min_speed': 0.0,
+     'max_accel': 0.25,
+     'max_decel': 0.35,
+@@ -22,7 +22,7 @@
+     'reference_path_length': 4.0,
+     'max_robot_pose_search_dist': 2.5,
+     'max_reference_deviation_m': 1.5,
+-    'seed_lookahead_dist': 1.00,
++    'seed_lookahead_dist': 4.00,
+     'minimum_tracking_speed': 0.10,
+     'cross_track_slowdown_m': 0.40,
+     'heading_slowdown_rad': 0.50,
+@@ -63,6 +63,8 @@
+         raise ValueError('controller_frequency must be at least 5 Hz for this 0.20 s model')
+     follow.update(UPDATES)
+     follow['control_dt'] = 1.0 / frequency
++    # Keep the smoother's forward limit aligned with the MPC speed cap.
++    nav['velocity_smoother']['ros__parameters']['max_velocity'][0] = 0.20
+     chassis = can['ackermann_can_controller']['ros__parameters']
+     if chassis.get('steering_input_mode', 'yaw_rate') != 'yaw_rate':
+         raise ValueError('CAN steering_input_mode must be yaw_rate')
+--- a/routes/current_route.yaml
++++ b/routes/current_route.yaml
+@@ -64,5 +64,5 @@
+     to_id: 6
+     direction: left
+     min_turning_radius: 2.7999999999999998
+-    speed_limit: 0.14999999999999999
++    speed_limit: 0.20
+     resolution: 0.10000000000000001
